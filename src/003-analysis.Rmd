@@ -1,0 +1,499 @@
+---
+title: "Hyeseon RNAseq"
+output:
+  html_document:
+    df_print: paged
+    highlight: tango
+    theme: united
+    toc: yes
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Read in the count data files
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+
+
+# list the file paths to the count files
+# full path to count files:
+# /home/gcalendo/data/projects/hyeSeon-rnaseq/results
+count_files <- list.files("../results", 
+                          pattern = "ReadsPerGene.out.tab",
+                          recursive = TRUE,
+                          full.names = TRUE)
+
+count_files <- count_files[!str_detect(count_files, "boot")]
+
+# read the count files into a single dataframe
+count_df <- vroom::vroom(count_files, 
+                         col_names = c("gene", "unstranded", "forward", "reverse"),
+                         id = "fpath")
+```
+
+## Clean the count dataframe
+
+```{r message=FALSE, warning=FALSE}
+library(magrittr)
+library(tools)
+
+
+count_df %<>% 
+  mutate(sample_name = basename(file_path_sans_ext(fpath)),
+         sample_name = str_remove(sample_name, ".ReadsPerGene.out")) %>% 
+  filter(!str_detect(gene, "^N_"),
+         unstranded > 0) %>% 
+  select(gene, sample_name, unstranded)
+
+head(count_df)
+```
+
+## Convert count dataframe to count matrix for edgeR
+
+```{r}
+count_mat <- count_df %>% 
+  pivot_wider(names_from = sample_name, values_from = unstranded, values_fill = 0) %>% 
+  column_to_rownames(var = "gene")
+
+head(count_mat)
+```
+
+## Create a dataframe of metadata
+
+```{r}
+run_info <- colnames(count_mat) %>% 
+  enframe(name = "row_id", value = "sample_name") %>% 
+  mutate(age = factor(case_when(str_detect(sample_name, "^O") ~ "old",
+                                str_detect(sample_name, "^Y") ~ "young"),
+                      levels = c("young", "old")),
+         region = factor(case_when(str_detect(sample_name, "A") ~ "aortic",
+                                   str_detect(sample_name, "T") ~ "thoracic")),
+         passage = factor(case_when(str_detect(sample_name, "P4$") ~ "p4",
+                                    str_detect(sample_name, "P5$") ~ "p5")),
+         group = factor(str_c(age, region, sep = "."))) %>% 
+  select(-row_id) %>% 
+  column_to_rownames(var = "sample_name")
+
+run_info
+```
+
+## Read GTF file into dataframe to get gene information
+
+This we can use GTF file to add gene biotype and gene length information
+
+```{r}
+gtf_file <- "/mnt/data/gdata/mouse/mm38_mm10/Mus_musculus.GRCm38.100.gtf"
+gtf_df <- as.data.frame(rtracklayer::import(gtf_file))
+
+head(gtf_df)
+
+# Check correctness
+gtf_df %>% 
+  filter(gene_id == "ENSMUSG00000020717")
+```
+
+## Extract gene lengths from the gtf file for every gene in the count matrix
+
+This information is useful if we want to calculate RPKM values, etc.
+
+```{r}
+gene_info <- gtf_df %>% 
+  filter(`type` == "gene",
+         gene_id %in% rownames(count_mat)) %>% 
+  select(gene_id, start, end, width, strand, gene_name, gene_biotype)
+
+# reorder the gene info table to match the order of count_mat
+gene_info <- gene_info[match(rownames(count_mat), gene_info$gene_id), ]
+rownames(gene_info) <- gene_info$gene_id
+
+# check the ordering is correct -- should eval to TRUE
+all(rownames(count_mat) == rownames(gene_info))
+```
+
+## colSums
+
+```{r}
+colSums(count_mat)
+```
+
+
+## Read count matrix and metadata into EdgeR object
+
+```{r}
+library(edgeR)
+
+
+# read data and metadata into edger
+y <- DGEList(counts = count_mat,
+             samples = run_info,
+             genes = gene_info)
+
+# double check correct gene_info -- SUCCESS!!
+y$genes %>% 
+  filter(gene_id == "ENSMUSG00000020717")
+```
+
+## Define the study design matrix
+
+Treat passage as a batch effect to correct for
+
+```{r}
+passages <- run_info$passage
+group <- run_info$group
+
+# model passage as a batch effect
+design <- model.matrix(~0 + group + passages)
+rownames(design) <- rownames(run_info)
+
+design
+```
+
+## Filter genes by expression
+
+Keep more genes for the analysis by relaxing the defaults.
+
+```{r}
+# modify defaults to keep more genes
+keep <- filterByExpr(y, 
+                     min.count = 1,
+                     min.total.count = 10,
+                     design = design)
+table(keep)
+
+y <- y[keep, ]
+```
+
+## Calculate normalization factors
+
+```{r}
+y <- calcNormFactors(y, method = 'TMM')
+```
+
+## Plot normalization results as mean difference plots
+
+These plots show that the normalization was effective. The MA plots are all 
+very well zero-centered.
+
+```{r}
+# create general plotting function
+plot_meanDifference = function(col) {
+ plotMD(cpm(y, log = TRUE), column = col)
+ abline(h = 0, col = "red", lty = 2, lwd = 2) 
+}
+
+# apply plot func to all columns
+walk(1:ncol(y$counts), plot_meanDifference)
+```
+
+## Quick MDS plot to see how samples separate
+
+MDS plots are analogous to PCA plots. These are showing that along the first
+axis the samples are separating by age/region. Passage differences occupy the
+second axis. 
+
+```{r}
+png(file = "../results/figures/mds.png")
+plotMDS(y)
+dev.off()
+
+plotMDS(y)
+```
+
+## Perform calculations on counts
+
+Used in downstream visualizations
+
+```{r}
+# counts per million
+cpms <- cpm(y, prior.count = 2)
+
+# log counts per million
+lcpms <- cpm(y, log = TRUE, prior.count = 2)
+
+# rpkms
+rpkms <- rpkm(y, log = FALSE, gene.length = "width")
+
+# log rpkms
+lrpkms <- rpkm(y, log = TRUE, gene.length = "width")
+
+# write out to files -----------------------------------------------------------
+cpms %>% 
+  as_tibble(rownames = "gene_id") %>% 
+  write_tsv("../results/data-files/cpms.tsv")
+
+lcpms %>% 
+  as_tibble(rownames = "gene_id") %>% 
+  write_tsv("../results/data-files/lcpms.tsv")
+
+rpkms %>% 
+  as_tibble(rownames = "gene_id") %>% 
+  write_tsv("../results/data-files/rpkms.tsv")
+
+lrpkms %>% 
+  as_tibble(rownames = "gene_id") %>% 
+  write_tsv("../results/data-files/lrpkms.tsv")
+```
+
+## Plot PCA, treating passage as a batch effect
+
+```{r}
+library(factoextra)
+library(FactoMineR)
+
+
+# remove the passage effect
+design_noBatch <- model.matrix(~group)
+lcpms_c <- removeBatchEffect(lcpms, batch = passages, design = design_noBatch)
+lrpkms_c <- removeBatchEffect(lrpkms, batch = passages, design = design_noBatch)
+
+# perform PCA on batch corrected logCPMS --------------------------------------
+pca_res <- PCA(t(lcpms_c), 
+               scale.unit = TRUE,
+               graph = FALSE)
+
+# plot scree plot from PCA -----------------------------------------------------
+fviz_eig(pca_res, addlabels = TRUE) +
+  ggtitle("Scree plot after batch correction") +
+  ggsave("../results/figures/scree.png",
+         width = 8,
+         height = 5)
+
+# plot PCA ---------------------------------------------------------------------
+ind <- get_pca_ind(pca_res)
+ind$coord %>% 
+  as_tibble(rownames = "sample_name") %>% 
+  left_join(as_tibble(run_info, rownames = "sample_name"),
+            by = "sample_name") %>% 
+  ggplot(aes(x = Dim.1, y = Dim.2, color = region, shape = age)) +
+  geom_point(size = 5) +
+  geom_hline(yintercept = 0, linetype = 3) +
+  geom_vline(xintercept = 0, linetype = 3) +
+  scale_color_brewer(palette = "Paired") +
+  labs(title = "PCA on batch (passage) corrected log(CPM)",
+       x = "PC1 (39.2%)",
+       y = "PC2 (26.4%)") +
+  theme_light() +
+  ggsave("../results/figures/pca.png",
+         width = 8,
+         height = 5)
+
+# write out batch corrected data -----------------------------------------------
+lcpms_c %>% 
+  as_tibble(rownames = "gene_id") %>% 
+  write_tsv("../results/data-files/bc-lcpms.tsv")
+
+lrpkms_c %>% 
+  as_tibble(rownames = "gene_id") %>% 
+  write_tsv("../results/data-files/bc-lrpkms.tsv")
+```
+
+## Boxplots of normalized expression
+
+If the samples were different by any condition we expect to see a large portion
+of genes (lines) diverging from one sample to another. However, these samples
+look relatively consistent (i.e. not many differences between any condition).
+
+```{r}
+# zscore the cpms data
+cpm_st <- as.data.frame(t(apply(cpms, 1, scale)))
+dimnames(cpm_st) <- dimnames(cpms)
+
+# plot expression boxplot with individual gene expression levels as a line plot
+cpm_st %>% 
+  as_tibble(rownames = "gene_id") %>% 
+  pivot_longer(-gene_id, names_to = "sample_name", values_to = "zscore") %>% 
+  mutate(sample_name = factor(sample_name)) %>% 
+  ggplot(aes(x = sample_name, y = zscore)) +
+  geom_line(aes(group = gene_id), alpha = 0.01) +
+  geom_boxplot() +
+  theme_bw() +
+  ggsave("../results/figures/boxplot.png",
+         width = 8,
+         height = 5)
+```
+
+## Scatterplot matrix of samples
+
+Scatterplot matrices are useful for seeing if samples within a treatment group
+are more similar to one another than to samples from a different treatment group
+
+```{r message=FALSE}
+library(GGally)
+
+# use the corrected counts
+ggpairs(as_tibble(lcpms_c))
+```
+
+## Quick heatmap of samples
+
+```{r}
+coolmap(lcpms_c, 
+        show.dendrogram = "column",
+        labRow = FALSE,
+        cexCol = 1,
+        main = "Heatmap of log(CPM)")
+```
+
+## Estimate dispersion
+
+```{r}
+y <- estimateDisp(y, design, robust = TRUE)
+```
+
+### Plot BCV
+
+```{r}
+plotBCV(y)
+```
+
+## Fit QL model
+
+```{r}
+fit <- glmQLFit(y, design, robust = TRUE)
+```
+
+### Plot QL dispersions
+
+```{r}
+plotQLDisp(fit)
+```
+
+## Differential Expression Testing
+
+### Install/load helper functions
+
+```{r eval=FALSE, include=FALSE}
+if (!require("devtools")) {
+  install.packages("devtools")
+}
+
+devtools::install_github("coriell-research/coriell")
+```
+
+### Set significance cutoffs
+
+Set to match DESeq2 parameters
+
+```{r}
+sig <- 0.1
+fc <- 1.5
+```
+
+### Create contrasts
+
+```{r}
+library(coriell)
+
+
+con <- makeContrasts(
+  O_v_Y = ((groupold.aortic + groupold.thoracic) / 2) - groupyoung.aortic,
+  T_v_A = groupold.thoracic - ((groupold.aortic + groupyoung.aortic) / 2),
+  oA_v_yA = groupold.aortic - groupyoung.aortic,
+  oT_v_oA = groupold.thoracic - groupold.aortic,
+  
+  levels = design
+)
+```
+
+### Old vs. Young
+
+```{r}
+ovy <- glmTreat(fit, contrast = con[, "O_v_Y"], lfc = log2(fc)) %>% 
+  edger_to_df()
+
+summarize_dge(ovy, fdr = sig, lfc = log2(fc))
+
+plot_volcano(ovy, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Old vs Young") +
+  ggsave("../results/figures/ovy-volcano.png",
+         width = 8, 
+         height = 5)
+
+plot_md(ovy, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Old vs Young") +
+  ggsave("../results/figures/ovy-md.png",
+         width = 8,
+         height = 5)
+```
+
+### Thoracic vs Aortic
+
+```{r}
+tva <- glmTreat(fit, contrast = con[, "T_v_A"], lfc = log2(fc)) %>% 
+  edger_to_df()
+
+summarize_dge(tva, fdr = sig, lfc = log2(fc))
+
+plot_volcano(tva, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Thoracic vs Aortic") +
+  ggsave("../results/figures/tva-volcano.png",
+         width = 8, 
+         height = 5)
+
+plot_md(tva, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Thoracic vs Aortic") +
+  ggsave("../results/figures/tva-md.png",
+         width = 8, 
+         height = 5)
+```
+
+### Old Aortic vs Young Aortic
+
+```{r}
+oA_v_yA <- glmTreat(fit, contrast = con[, "oA_v_yA"], lfc = log2(fc)) %>% 
+  edger_to_df()
+
+summarize_dge(oA_v_yA, fdr = sig, lfc = log2(fc))
+
+plot_volcano(oA_v_yA, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Old Aortic vs Young Aortic") +
+  ggsave("../results/figures/oA_v_yA-volcano.png",
+         width = 8, 
+         height = 5)
+
+plot_md(oA_v_yA, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Old Aortic vs Young Aortic") +
+  ggsave("../results/figures/oA_v_yA-md.png",
+         width = 8, 
+         height = 5)
+```
+
+### Old Thoracic vs Old Aortic
+
+```{r}
+oT_v_oA <- glmTreat(fit, contrast = con[, "oT_v_oA"], lfc = log2(fc)) %>% 
+  edger_to_df()
+
+summarize_dge(oT_v_oA, fdr = sig, lfc = log2(fc))
+
+plot_volcano(oT_v_oA, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Old Thoracic vs Old Aortic") +
+  ggsave("../results/figures/oT_v_oA-volcano.png",
+         width = 8, 
+         height = 5)
+
+plot_md(oT_v_oA, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Old Thoracic vs Old Aortic") +
+  ggsave("../results/figures/oT_v_oA-md.png",
+         width = 8, 
+         height = 5)
+```
+
+## Combine results into list and write out
+
+```{r}
+res_list <- list("edger.old_vs_young" = ovy,
+                 "edger.thoracic_vs_aortic" = tva,
+                 "edger.oldArotic_vs_youngAortic" = oA_v_yA,
+                 "edger.oldThoracic_vs_oldAortic" = oT_v_oA)
+
+bind_rows(res_list, .id = "contrast") %>%
+  write_tsv("../results/data-files/edger-dge.tsv")
+```
+
+
+

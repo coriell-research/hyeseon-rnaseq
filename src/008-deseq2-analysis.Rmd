@@ -1,0 +1,298 @@
+---
+title: "Hyeseon RNAseq - DESeq2"
+output:
+  html_document:
+    df_print: paged
+    highlight: tango
+    theme: united
+    toc: yes
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.width = 8,
+  fig.height = 5
+  )
+```
+
+## Read in count files
+
+```{r, message=FALSE}
+library(tidyverse)
+
+
+# list all count files -- these include boostrapped counts
+count_files <- list.files("../results",
+                          recursive = TRUE,
+                          pattern = ".ReadsPerGene.out.tab$",
+                          full.names = TRUE)
+
+# remove bootstrapped counts from count files
+count_files <- count_files[!str_detect(count_files, "boot")]
+
+# read count files into a single dataframe
+count_df <- vroom::vroom(count_files,
+                         delim = "\t",
+                         col_names = c("gene", "unstranded", "forward", "reverse"),
+                         id = "fpath")
+
+head(count_df)
+```
+
+## Clean up count files
+
+- remove N_ rows 
+- select only unstranded counts
+- extract sample_names from files paths
+
+```{r}
+library(tools)
+library(magrittr)
+
+
+count_df %<>% 
+  filter(!str_detect(gene, "^N_")) %>% 
+  mutate(sample_name = basename(file_path_sans_ext(fpath)),
+         sample_name = str_remove(sample_name, ".ReadsPerGene.out")) %>% 
+  select(gene, sample_name, unstranded) %>% 
+  filter(unstranded > 0)
+
+head(count_df)
+```
+
+## Coerce count_df to a count matrix
+
+```{r}
+count_mat <- count_df %>% 
+  pivot_wider(names_from = sample_name, 
+              values_from = unstranded,
+              values_fill = 0) %>% 
+  column_to_rownames(var = "gene")
+
+head(count_mat)
+```
+
+## Create colData for DEseq2
+
+```{r}
+col_data <- colnames(count_mat) %>% 
+  enframe(name = "row_id", value = "sample_name") %>% 
+  separate(sample_name, 
+           into = c("age", "region", "passage"),
+           sep = "_",
+           remove = FALSE) %>% 
+  mutate(group = factor(str_c(age, region, sep = ".")),
+         passage = factor(passage)) %>% 
+  select(sample_name, group, passage) %>% 
+  column_to_rownames(var = "sample_name")
+
+head(col_data)
+```
+
+## Read data into deseq2 object and run DE pipeline
+
+In the design matrix below we treat passage as a covariate and we will treat
+the concatenation of age and organ each as a single group. This will allow
+us to correct for the effect of passage (which is appearing as a strong 
+batch effect) if we wish to treat each passage as a biological replicate.
+
+```{r message=FALSE, warning=FALSE}
+library(DESeq2)
+
+
+dds <- DESeqDataSetFromMatrix(countData = count_mat,
+                              colData = col_data,
+                              design = ~0 + group + passage)
+
+dds <- DESeq(dds)
+
+# view the groups that will be used in the contrasts
+resultsNames(dds)
+```
+
+## DE results
+
+### Set significance and FC levels
+
+```{r}
+sig <- 0.1
+fc <- 1.5
+```
+
+### Old vs. Young
+
+The contrast below indicates averaging the expression for "groupO.A" and 
+"groupO.T" and comparing it to the expression of "groupY.A".
+
+```{r}
+# load helper functions for plotting
+library(coriell)  # devtools::install_github("coriell-research/coriell")
+
+
+# extract DE results from DESeq object
+ovy <- results(dds, 
+              contrast = c(0.5, 0.5, -1, 0),
+              lfcThreshold = log2(fc),
+              alpha = sig,
+              altHypothesis = "greaterAbs")
+
+# convert to dataframe
+ovy_df <- ovy %>% 
+  as_tibble(rownames = "gene") %>% 
+  mutate(padj = replace_na(padj, 1))
+
+# show volcano plot
+plot_volcano(ovy_df, 
+             x = log2FoldChange,
+             y = padj,
+             fdr = sig,
+             lfc = log2(fc)) +
+  ggtitle("Old vs Young") +
+  ggsave("../results/figures/ovy-volcano.deseq.png",
+         width = 8,
+         height = 5)
+
+# show MD plot
+plot_md(ovy_df,
+        x = log10(baseMean),
+        y = log2FoldChange,
+        sig_col = padj,
+        fdr = sig,
+        lfc = log2(fc)) +
+  ggtitle("Old vs Young") +
+  ggsave("../results/figures/ovy-md.deseq.png",
+         width = 8,
+         height = 5)
+```
+
+### Thoracic vs. Aortic
+
+```{r}
+# extract DE results from DESeq object
+tva <- results(dds, 
+              contrast = c(-0.5, 1, -0.5, 0),
+              lfcThreshold = log2(fc),
+              alpha = sig,
+              altHypothesis = "greaterAbs")
+
+# convert to dataframe
+tva_df <- tva %>% 
+  as_tibble(rownames = "gene") %>% 
+  mutate(padj = replace_na(padj, 1))
+
+# show volcano plot
+plot_volcano(tva_df, 
+             x = log2FoldChange,
+             y = padj,
+             fdr = sig,
+             lfc = log2(fc)) +
+  ggtitle("Thoracic vs. Aortic") +
+  ggsave("../results/figures/tva-volcano.deseq.png",
+         width = 8,
+         height = 5)
+
+# show MD plot
+plot_md(tva_df,
+        x = log10(baseMean),
+        y = log2FoldChange,
+        sig_col = padj,
+        fdr = sig,
+        lfc = log2(fc)) +
+  ggtitle("Thoracic vs. Aortic") +
+  ggsave("../results/figures/tva-md.deseq.png",
+         width = 8,
+         height = 5)
+```
+
+### Old Aortic vs. Young Aortic
+
+```{r}
+# extract DE results from DESeq object
+oA_v_yA <- results(dds, 
+                  contrast = c(1, 0, -1, 0),
+                  lfcThreshold = log2(fc),
+                  alpha = sig,
+                  altHypothesis = "greaterAbs")
+
+# convert to dataframe
+oA_v_yA_df <- oA_v_yA %>% 
+  as_tibble(rownames = "gene") %>% 
+  mutate(padj = replace_na(padj, 1))
+
+# show volcano plot
+plot_volcano(oA_v_yA_df, 
+             x = log2FoldChange,
+             y = padj,
+             fdr = sig,
+             lfc = log2(fc)) +
+  ggtitle("Old Aortic vs. Young Aortic") +
+  ggsave("../results/figures/oA_v_yA-volcano.deseq.png",
+         width = 8,
+         height = 5)
+
+# show MD plot
+plot_md(oA_v_yA_df,
+        x = log10(baseMean),
+        y = log2FoldChange,
+        sig_col = padj,
+        fdr = sig,
+        lfc = log2(fc)) +
+  ggtitle("Old Aortic vs. Young Aortic")+
+  ggsave("../results/figures/oA_v_yA-md.deseq.png",
+         width = 8,
+         height = 5)
+```
+
+### Old Thoracic vs Old Aortic
+
+```{r}
+# extract DE results from DESeq object
+oT_v_OA <- results(dds, 
+                   contrast = c(-1, 1, 0, 0),
+                   lfcThreshold = log2(fc),
+                   alpha = sig,
+                   altHypothesis = "greaterAbs")
+
+# convert to dataframe
+oT_v_oA_df <- oT_v_OA %>% 
+  as_tibble(rownames = "gene") %>% 
+  mutate(padj = replace_na(padj, 1))
+
+# show volcano plot
+plot_volcano(oT_v_oA_df, 
+             x = log2FoldChange,
+             y = padj,
+             fdr = sig,
+             lfc = log2(fc)) +
+  ggtitle("Old Thoracic vs. Old Aortic") +
+  ggsave("../results/figures/oT_v_oA-volcano.deseq.png",
+         width = 8,
+         height = 5)
+
+# show MD plot
+plot_md(oT_v_oA_df,
+        x = log10(baseMean),
+        y = log2FoldChange,
+        sig_col = padj,
+        fdr = sig,
+        lfc = log2(fc)) +
+  ggtitle("Old Thoracic vs. Old Aortic") +
+  ggsave("../results/figures/oT_v_oA-md.deseq.png",
+         width = 8,
+         height = 5)
+```
+
+## Combine all results into a single dataframe and write out
+
+```{r}
+res_list <- list("deseq.old_vs_young" = ovy_df,
+                 "deseq.thoracic_vs_aortic" = tva_df,
+                 "deseq.oldArotic_vs_youngAortic" = oA_v_yA_df,
+                 "deseq.oldThoracic_vs_oldAortic" = oT_v_oA_df)
+
+bind_rows(res_list, .id = "contrast") %>%
+  write_tsv("../results/data-files/deseq2-dge.tsv")
+```
+

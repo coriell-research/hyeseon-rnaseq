@@ -1,0 +1,414 @@
+---
+title: "Hyseon RNAseq Bootstrapped"
+output:
+  html_document:
+    df_print: paged
+    highlight: tango
+    theme: united
+    toc: yes
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Read in count files
+
+```{r}
+count_files <- list.files("../results",
+                          recursive = TRUE,
+                          pattern = ".*.ReadsPerGene.out.tab",
+                          full.names = TRUE)
+
+# read the count files into a single dataframe
+count_df <- vroom::vroom(count_files, 
+                         col_names = c("gene", "unstranded", "forward", "reverse"),
+                         id = "fpath")
+```
+
+## Clean the count dataframe
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(magrittr)
+library(tools)
+
+
+count_df %<>% 
+  mutate(sample_name = basename(file_path_sans_ext(fpath)),
+         sample_name = str_remove(sample_name, ".ReadsPerGene.out")) %>% 
+  filter(!str_detect(gene, "^N_"),
+         unstranded > 0) %>% 
+  select(gene, sample_name, unstranded)
+
+head(count_df)
+```
+
+## Convert count dataframe to count matrix for edgeR
+
+```{r}
+count_mat <- count_df %>% 
+  pivot_wider(names_from = sample_name, 
+              values_from = unstranded, 
+              values_fill = 0) %>% 
+  column_to_rownames(var = "gene")
+
+# fix colnames to reflect technical replicates
+basenames <- colnames(count_mat) %>% 
+  str_remove(".boot.*")
+
+# create numbers for technical replicates
+tech_num <- c(rep(2:6, 6), rep(1, 6))
+newnames <- str_c(basenames, tech_num, sep = ".")
+
+colnames(count_mat) <- newnames
+
+head(count_mat)
+```
+
+## Create a dataframe of metadata
+
+```{r}
+run_info <- colnames(count_mat) %>% 
+  enframe(name = "row_id", value = "sample_name") %>% 
+  mutate(age = factor(case_when(str_detect(sample_name, "^O") ~ "old",
+                                str_detect(sample_name, "^Y") ~ "young")),
+         region = factor(case_when(str_detect(sample_name, "A") ~ "aortic",
+                                   str_detect(sample_name, "T") ~ "thoracic")),
+         passage = factor(case_when(str_detect(sample_name, "P4") ~ "p4",
+                                    str_detect(sample_name, "P5") ~ "p5")),
+         group = factor(str_c(age, region, sep = "."))) %>% 
+  select(-row_id) %>% 
+  column_to_rownames(var = "sample_name")
+
+run_info
+```
+
+## Perform calculations on counts
+
+Used in downstream visualizations
+
+```{r}
+library(edgeR)
+
+
+# NOTE: technical replicates are cols
+y <- DGEList(counts = count_mat,
+             samples = run_info)
+
+# define levels of the design if not using groups
+passages <- run_info$passage
+group <- run_info$group
+design <- model.matrix(~0 + group + passages)
+rownames(design) <- rownames(run_info)
+
+keep <- filterByExpr(y, 
+                     min.count = 1,
+                     min.total.count = 10, 
+                     design = design)
+table(keep)
+y <- y[keep, ,keep.lib.sizes = FALSE]
+```
+
+## Plot PCA
+
+Calculate PCA on the logCPM data and visualize -- should be about the same as 
+the MDS plot above.
+
+```{r}
+library(factoextra)
+
+
+lcpms <- cpm(y, log = TRUE, prior.count = 2)
+
+# perform PCA on log(cpms)
+pca_lcpms <- prcomp(t(lcpms), 
+                    scale = TRUE,
+                    center = TRUE)
+
+# plot scree plot from PCA
+fviz_eig(pca_lcpms, addlabels = TRUE) + 
+  ggtitle("Passage (PC1) explains the most variance") +
+  ggsave("../results/figures/scree_uncorrected.boot.png", 
+         width = 8, 
+         height = 5)
+
+# plot PCA
+lcpm_df <- pca_lcpms$x %>% 
+  as_tibble(rownames = "sample_name") %>% 
+  select(sample_name, PC1, PC2) %>% 
+  left_join(as_tibble(run_info, rownames = "sample_name"),
+            by = "sample_name")
+
+lcpm_df %>% 
+  ggplot(aes(x = PC1, y = PC2)) +
+  geom_point(data = subset(lcpm_df, age == "old"),
+             aes(color = region, shape = age),
+             size = 7) +
+  geom_point(data = subset(lcpm_df, age == "old"),
+             color = "black", size = 7, shape = 1) +
+  geom_point(data = subset(lcpm_df, age == "young"),
+             aes(color = region, shape = age),
+             size = 7) +
+  geom_point(data = subset(lcpm_df, age == "young"),
+             color = "black", size = 7, shape = 2) +
+  geom_hline(yintercept = 0, linetype = 3) +
+  geom_vline(xintercept = 0, linetype = 3) +
+  labs(title = "PCA of log(CPM)",
+       subtitle = "No information gained from bootstrapped replicates",
+       x = "PC 1",
+       y = "PC 2") +
+  theme_light() +
+  scale_color_brewer(palette = "Paired") +
+  facet_wrap(~passage) +
+  ggsave("../results/figures/pca_uncorrected.boot.png",
+         width = 8,
+         height = 5)
+```
+
+## Treat passage as batch effect
+
+```{r}
+library(FactoMineR)
+
+
+d2 <- model.matrix(~0 + group)
+
+mat_c <- removeBatchEffect(lcpms, batch = passages, design = d2)
+
+pca_res <- PCA(t(mat_c), scale.unit = TRUE, graph = FALSE)
+
+ind <- get_pca_ind(pca_res)
+
+pca_df <- ind$coord %>% 
+  as_tibble(rownames = "sample_name") %>% 
+  select(sample_name, Dim.1, Dim.2) %>% 
+  left_join(as_tibble(run_info, rownames = "sample_name"),
+            by = "sample_name")
+
+# plot scree plot from PCA
+fviz_eig(pca_res, addlabels = TRUE) + 
+  ggtitle("Treating passage as batch eefect improves clustering") +
+  ggsave("../results/figures/scree.boot.png", 
+         width = 8, 
+         height = 5)
+
+pca_df %>% 
+  ggplot(aes(x = Dim.1, y = Dim.2)) +
+  geom_point(data = subset(pca_df, age == "old"),
+             aes(color = region, shape = age),
+             size = 7) +
+  geom_point(data = subset(pca_df, age == "old"),
+             color = "black", size = 7, shape = 1) +
+  geom_point(data = subset(pca_df, age == "young"),
+             aes(color = region, shape = age),
+             size = 7) +
+  geom_point(data = subset(pca_df, age == "young"),
+             color = "black", size = 7, shape = 2) +
+  geom_hline(yintercept = 0, linetype = 3) +
+  geom_vline(xintercept = 0, linetype = 3) +
+  labs(title = "PCA of log(CPM)",
+       subtitle = "Treating passage as a batch effect",
+       x = "PC 1",
+       y = "PC 2") +
+  theme_light() +
+  scale_color_brewer(palette = "Paired") +
+  ggsave("../results/figures/pca.boot.png",
+         width = 8,
+         height = 5)
+```
+
+## Boxplots of normalized expression
+
+If the samples were different by any condition we expect to see a large portion
+of genes (lines) diverging from one sample to another. However, these samples
+look relatively consistent (i.e. not many differences between any condition).
+
+```{r}
+cpms <- cpm(y, prior.count = 2)
+
+# zscore the cpms data
+cpm_st <- as.data.frame(t(apply(cpms, 1, scale)))
+dimnames(cpm_st) <- dimnames(cpms)
+
+# plot expression boxplot with individual gene expression levels as a line plot
+cpm_st %>% 
+  as_tibble(rownames = "gene_id") %>% 
+  pivot_longer(-gene_id, names_to = "sample_name", values_to = "zscore") %>% 
+  mutate(sample_name = factor(sample_name)) %>% 
+  ggplot(aes(x = sample_name, y = zscore)) +
+  geom_line(aes(group = gene_id), alpha = 0.01) +
+  labs(x = NULL,
+       y = "z-score (CPM)") +
+  geom_boxplot() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggsave("../results/figures/boxplot.boot.png", 
+         width = 8, 
+         height = 5)
+```
+
+---
+
+# Differential Expression Tests
+
+## Sum technical replicates repeat edger pipeline
+
+```{r}
+# rename the columns to reflect the technical replication ----------------------
+colnames(count_mat) <- colnames(count_mat) %>% str_remove(".[0-9]$")
+
+# collapse the technical replicates by summing ---------------------------------
+count_mat2 <- sumTechReps(count_mat)
+
+# create new run_info ----------------------------------------------------------
+run_info2 <- colnames(count_mat2) %>% 
+  enframe(name = "row_id", value = "sample_name") %>% 
+  mutate(age = factor(case_when(str_detect(sample_name, "^O") ~ "old",
+                                str_detect(sample_name, "^Y") ~ "young")),
+         age = factor(age, levels = c("young", "old")),
+         region = factor(case_when(str_detect(sample_name, "A") ~ "aortic",
+                                   str_detect(sample_name, "T") ~ "thoracic")),
+         passage = factor(case_when(str_detect(sample_name, "P4") ~ "p4",
+                                    str_detect(sample_name, "P5") ~ "p5")),
+         group = factor(str_c(age, region, sep = "."))) %>% 
+  select(-row_id) %>% 
+  column_to_rownames(var = "sample_name")
+
+# read into edger --------------------------------------------------------------
+y2 <- DGEList(counts = count_mat2,
+              samples = run_info2)
+
+# define the design matrix -----------------------------------------------------
+passages <- run_info2$passage
+groups <- run_info2$group
+
+design <- model.matrix(~0 + groups + passages)
+rownames(design) <- rownames(run_info2)
+
+# filter counts by expression --------------------------------------------------
+# summing the counts requires more filtering
+keep <- filterByExpr(y2, design = design)
+table(keep)
+
+y2 <- y2[keep, ,keep.lib.sizes = FALSE]
+
+# calculate normalization factors ----------------------------------------------
+y2 <- calcNormFactors(y2, method = 'TMM')
+
+# estimate dispersion ----------------------------------------------------------
+y2 <- estimateDisp(y2, robust = TRUE, design = design)
+
+# fit GLM model ----------------------------------------------------------------
+fit <- glmQLFit(y2, design = design)
+```
+
+### Set significance cutoffs
+
+Set to match DESeq2 parameters
+
+```{r}
+sig <- 0.1
+fc <- 1.5
+```
+
+### Create contrasts
+
+```{r}
+con <- makeContrasts(
+  O_v_Y = ((groupsold.aortic + groupsold.thoracic) / 2) - groupsyoung.aortic,
+  T_v_A = groupsold.thoracic - ((groupsold.aortic + groupsyoung.aortic) / 2),
+  oA_v_yA = groupsold.aortic - groupsyoung.aortic,
+  oT_v_oA = groupsold.thoracic - groupsold.aortic,
+  
+  levels = design
+)
+```
+
+### Old vs. Young
+
+```{r}
+library(coriell)
+
+
+ovy <- glmTreat(fit, contrast = con[, "O_v_Y"], lfc = log2(fc)) %>% 
+  edger_to_df()
+
+summarize_dge(ovy, fdr = sig, lfc = log2(fc))
+
+plot_volcano(ovy, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Old vs Young") +
+  ggsave("../results/figures/ovy-volcano.boot.png",
+         width = 8, 
+         height = 5)
+
+plot_md(ovy, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Old vs Young") +
+  ggsave("../results/figures/ovy-md.boot.png",
+         width = 8,
+         height = 5)
+```
+
+### Thoracic vs Aortic
+
+```{r}
+tva <- glmTreat(fit, contrast = con[, "T_v_A"], lfc = log2(fc)) %>% 
+  edger_to_df()
+
+summarize_dge(tva, fdr = sig, lfc = log2(fc))
+
+plot_volcano(tva, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Thoracic vs Aortic") +
+  ggsave("../results/figures/tva-volcano.boot.png",
+         width = 8, 
+         height = 5)
+
+plot_md(tva, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Thoracic vs Aortic") +
+  ggsave("../results/figures/tva-md.boot.png",
+         width = 8, 
+         height = 5)
+```
+
+### Old Aortic vs Young Aortic
+
+```{r}
+oA_v_yA <- glmTreat(fit, contrast = con[, "oA_v_yA"], lfc = log2(fc)) %>% 
+  edger_to_df()
+
+summarize_dge(oA_v_yA, fdr = sig, lfc = log2(fc))
+
+plot_volcano(oA_v_yA, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Old Aortic vs Young Aortic") +
+  ggsave("../results/figures/oA_v_yA-volcano.boot.png",
+         width = 8, 
+         height = 5)
+
+plot_md(oA_v_yA, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Old Aortic vs Young Aortic") +
+  ggsave("../results/figures/oA_v_yA-md.boot.png",
+         width = 8, 
+         height = 5)
+```
+
+### Old Thoracic vs Old Aortic
+
+```{r}
+oT_v_oA <- glmTreat(fit, contrast = con[, "oT_v_oA"], lfc = log2(fc)) %>% 
+  edger_to_df()
+
+summarize_dge(oT_v_oA, fdr = sig, lfc = log2(fc))
+
+plot_volcano(oT_v_oA, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Old Thoracic vs Old Aortic") +
+  ggsave("../results/figures/oT_v_oA-volcano.boot.png",
+         width = 8, 
+         height = 5)
+
+plot_md(oT_v_oA, fdr = sig, lfc = log2(fc)) +
+  ggtitle("Old Thoracic vs Old Aortic") +
+  ggsave("../results/figures/oT_v_oA-md.boot.png",
+         width = 8, 
+         height = 5)
+```

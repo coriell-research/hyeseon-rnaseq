@@ -1,0 +1,125 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Read in rpkm files
+
+```{r}
+library(tidyverse)
+library(here)
+
+
+rpkms <- read_tsv(here("results", "data-files", "rpkms.tsv"))
+lrpkms <- read_tsv(here("results", "data-files", "lrpkms.tsv"))
+```
+
+## Plot histograms of counts
+
+```{r}
+# pivot the rpkm data longer and add sample information
+rpkm_df <- rpkms %>% 
+  pivot_longer(-gene_id,
+               names_to = "sample_name",
+               values_to = "rpkm") %>% 
+  mutate(age = if_else(str_detect(sample_name, "^O"), "Old", "Young"),
+         region = if_else(str_detect(sample_name, "A"), "Aortic", "Thoracic"),
+         age = factor(age, levels = c("Young", "Old")),
+         region = factor(region))
+
+# do the same for the logRPKM data
+lrpkm_df <- lrpkms %>% 
+  pivot_longer(-gene_id,
+               names_to = "sample_name",
+               values_to = "lrpkm") %>% 
+  mutate(age = if_else(str_detect(sample_name, "^O"), "Old", "Young"),
+         region = if_else(str_detect(sample_name, "A"), "Aortic", "Thoracic"),
+         age = factor(age, levels = c("Young", "Old")),
+         region = factor(region))
+
+# plot the histograms for each sample ------------------------------------------
+rpkm_df %>% 
+  ggplot(aes(x = rpkm)) +
+  geom_histogram() +
+  scale_x_log10() +
+  theme_light() +
+  facet_wrap(~sample_name) +
+  labs(x = "RPKM",
+       y = "Count")
+```
+
+## Create a mock expression-methylation boxplot
+
+### Create some fake data
+
+```{r}
+n_samples <- 6
+n_genes <- 1e4
+bcv <- 0.5
+
+fake_rpkm <- matrix(rnbinom(n_genes * n_samples, size = 1 / bcv^2, mu = 1e4), 
+                    nrow = n_genes,
+                    ncol = n_samples)
+rownames(fake_rpkm) <- paste("gene", 1:n_genes, sep = ".")
+colnames(fake_rpkm) <- paste("sample", 1:n_samples, sep = ".")
+fake_rpkm <- as.data.frame(fake_rpkm)
+head(fake_rpkm)
+
+fake_meth <- matrix(data = runif(n_genes * n_samples, min = 0, max = 100),
+                    nrow = n_genes,
+                    ncol = n_samples)
+rownames(fake_meth) <- paste("gene", 1:n_genes, sep = ".")
+colnames(fake_meth) <- paste("sample", 1:n_samples, sep = ".")
+fake_meth <- as.data.frame(fake_meth)
+head(fake_meth)
+```
+
+### Create a single data frame using the fake data
+
+Combine the RPKM and methylation data by joining on the gene ids and creating a 
+single column for RPKMs and Methylation data
+
+```{r}
+fake_df <- 
+  as_tibble(fake_rpkm, rownames = "gene_id") %>% 
+  left_join(as_tibble(fake_meth, rownames = "gene_id"), 
+            by = "gene_id",
+            suffix = c(".rpkm", ".meth")) %>% 
+  pivot_longer(-gene_id, names_to = "name", values_to = "value") %>% 
+  mutate(sample_name = str_extract(name, "sample.[1-6]"),
+         metric = str_extract(name, "rpkm|meth")) %>% 
+  select(gene_id, sample_name, value, metric) %>% 
+  pivot_wider(names_from = metric, values_from = value)
+
+head(fake_df)
+```
+
+### Create expression boxplots for the fake data
+
+```{r}
+fake_df <- fake_df %>% 
+  mutate(meth_bin = case_when(between(meth, 0, 10) ~ "0-10",
+                              between(meth, 10, 50) ~ "10-50",
+                              between(meth, 50, 80) ~ "50-80",
+                              between(meth, 80, 100) ~ "80-100"),
+         meth_bin = factor(meth_bin, levels = c("0-10", "10-50", "50-80", "80-100")))
+
+head(fake_df)
+
+# create the expression boxplot
+fake_df %>% 
+  ggplot(aes(x = meth_bin, y = rpkm)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  facet_wrap(~sample_name) +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Fake Expression vs. Fake Methylation",
+       x = "Fake Methylation %",
+       y = "Fake RPKM")
+```
+
