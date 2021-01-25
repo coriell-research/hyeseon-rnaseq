@@ -120,6 +120,28 @@ all(rownames(count_mat) == rownames(gene_info))
 colSums(count_mat)
 ```
 
+## Plot expression of raw counts
+
+```{r}
+# compute raw CPM values
+raw_cpms <- count_mat / colSums(count_mat) * 1e6
+
+# plot the distribution of the library-size normalized counts
+raw_cpms %>% 
+  as_tibble(rownames = "gene_id") %>% 
+  pivot_longer(-gene_id, names_to = "sample_name", values_to = "count") %>% 
+  ggplot(aes(x = count)) +
+  geom_histogram() +
+  scale_x_log10() +
+  facet_wrap(~sample_name) +
+  theme_light() +
+  labs(title = "Distribution of Raw Counts",
+       x = "CPM",
+       y = "Count") +
+  ggsave("../results/figures/raw-count-distributions.png",
+         width = 8,
+         height = 5)
+```
 
 ## Read count matrix and metadata into EdgeR object
 
@@ -219,6 +241,18 @@ rpkms <- rpkm(y, log = FALSE, gene.length = "width")
 
 # log rpkms
 lrpkms <- rpkm(y, log = TRUE, gene.length = "width")
+
+# counts per million by group
+cpm_by_group <- cpmByGroup(y, prior.count = 2)
+
+# log cpm by group
+lcpm_by_group <- cpmByGroup(y, log = TRUE, prior.count = 2)
+
+# rpkm by groups
+rpkm_by_group <- rpkmByGroup(y, gene.length = "width")
+
+# log rpkm by group
+lrpkm_by_group <- rpkmByGroup(y, log = TRUE, gene.length = "width")
 
 # write out to files -----------------------------------------------------------
 cpms %>% 
