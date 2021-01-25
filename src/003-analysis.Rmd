@@ -195,6 +195,27 @@ y <- y[keep, ]
 y <- calcNormFactors(y, method = 'TMM')
 ```
 
+## Plot distribution after filtering and normalization
+
+```{r}
+# cpm() incorporates the normalization factor when calculating CPMs 
+cpm(y) %>% 
+  as_tibble(rownames = "gene_id") %>% 
+  pivot_longer(-gene_id, names_to = "sample_name", values_to = "count") %>% 
+  ggplot(aes(x = count)) +
+  geom_histogram() +
+  scale_x_log10() +
+  facet_wrap(~sample_name) +
+  theme_light() +
+  labs(title = "Distribution of Filtered + Normalized Counts",
+       x = "CPM",
+       y = "Count") +
+  ggsave("../results/figures/filtered-normalized-count-distributions.png",
+         width = 8,
+         height = 5)
+```
+
+
 ## Plot normalization results as mean difference plots
 
 These plots show that the normalization was effective. The MA plots are all 
